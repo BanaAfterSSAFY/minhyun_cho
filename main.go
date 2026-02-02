@@ -22,7 +22,7 @@ func main() {
 	}
 	defer client.Close()
 
-	model := client.GenerativeModel("gemini-pro")
+	model := client.GenerativeModel("gemini-2.5-pro")
 
 	// 1. 기존 증분 추적 로직 (주석 처리)
 	/*
