@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,7 +14,6 @@ import (
 )
 
 func main() {
-	// 1. 환경 변수 및 클라이언트 설정
 	apiKey := os.Getenv("GEMINI_API_KEY")
 	ctx := context.Background()
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
@@ -25,49 +24,53 @@ func main() {
 
 	model := client.GenerativeModel("gemini-pro")
 
-	// 2. 이번 커밋에서 변경된 .java 파일 목록 가져오기
-	changedFiles := getChangedJavaFiles()
-	if len(changedFiles) == 0 {
-		fmt.Println("리뷰할 새로운 .java 파일이 없음.")
+	// 1. 기존 증분 추적 로직 (주석 처리)
+	/*
+	out, _ := exec.Command("git", "diff", "--name-only", "HEAD^", "HEAD").Output()
+	allFiles := strings.Split(string(out), "\n")
+	*/
+
+	// 2. 레포지토리 내 모든 .java 파일 가져오기
+	javaFiles := getAllJavaFiles()
+	if len(javaFiles) == 0 {
+		fmt.Println("리뷰할 .java 파일이 없음.")
 		return
 	}
 
-	// 3. 각 파일별로 리뷰 진행
-	for _, filePath := range changedFiles {
+	for _, filePath := range javaFiles {
 		processFile(ctx, model, filePath)
 	}
 }
 
-func getChangedJavaFiles() []string {
-	// 마지막 커밋과 그 이전 커밋의 차이를 비교하여 파일명만 추출함
-	out, err := exec.Command("git", "diff", "--name-only", "HEAD^", "HEAD").Output()
-	if err != nil {
-		return nil
-	}
-
-	allFiles := strings.Split(string(out), "\n")
+func getAllJavaFiles() []string {
 	var javaFiles []string
-	for _, f := range allFiles {
-		f = strings.TrimSpace(f)
-		// .java 확장자이고 파일이 실제로 존재하는 경우만 포함함
-		if strings.HasSuffix(f, ".java") {
-			if _, err := os.Stat(f); err == nil {
-				javaFiles = append(javaFiles, f)
-			}
+	// 현재 폴더(.)부터 하위 폴더까지 모든 파일을 탐색함
+	err := filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
 		}
+		// 파일이면서 .java 확장자인 경우만 리스트에 추가함
+		// (단, reviews 폴더 안의 파일이나 숨김 폴더는 제외함)
+		if !info.IsDir() && strings.HasSuffix(path, ".java") && !strings.Contains(path, "reviews") {
+			javaFiles = append(javaFiles, path)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("파일 탐색 중 에러 발생: %v", err)
 	}
 	return javaFiles
 }
 
 func processFile(ctx context.Context, model *genai.GenerativeModel, filePath string) {
-	fmt.Printf("%s 파일 리뷰 중...\n", filePath)
+	fmt.Printf("%s 파일 분석 및 리뷰 중...\n", filePath)
 
 	content, err := os.ReadFile(filePath)
 	if err != nil {
+		log.Printf("%s 파일 읽기 실패: %v", filePath, err)
 		return
 	}
 
-	// AI에게 전달할 프롬프트 구성
 	promptText := fmt.Sprintf(`
 너는 알고리즘 전문가이자 기술 블로거야. 아래 코딩 테스트 풀이(.java)를 분석해서 블로그 포스팅용 마크다운을 작성해줘.
 
@@ -87,30 +90,34 @@ func processFile(ctx context.Context, model *genai.GenerativeModel, filePath str
 		return
 	}
 
-	// 결과 저장
 	saveReview(filePath, resp)
 }
 
 func saveReview(filePath string, resp *genai.GenerateContentResponse) {
 	reviewDir := "reviews"
+	// reviews 폴더가 없으면 생성함
 	if _, err := os.Stat(reviewDir); os.IsNotExist(err) {
-		os.Mkdir(reviewDir, 0755)
-	}
-
-	// 파일명에서 확장자 제거 후 _review.md 붙임
-	baseName := strings.TrimSuffix(filePath, ".java")
-	reviewPath := fmt.Sprintf("%s/%s_review.md", reviewDir, baseName)
-
-	result := ""
-	for _, cand := range resp.Candidates {
-		for _, part := range cand.Content.Parts {
-			result += fmt.Sprintf("%v", part)
+		err := os.MkdirAll(reviewDir, 0755)
+		if err != nil {
+			log.Printf("폴더 생성 실패: %v", err)
+			return
 		}
 	}
 
-	// 메타데이터 추가 (블로그용)
+	// 파일 경로에서 파일명만 추출하여 저장용 이름 생성함
+	baseName := filepath.Base(filePath)
+	reviewFileName := strings.TrimSuffix(baseName, ".java")
+	reviewPath := fmt.Sprintf("%s/%s_review.md", reviewDir, reviewFileName)
+
+	var result strings.Builder
+	for _, cand := range resp.Candidates {
+		for _, part := range cand.Content.Parts {
+			result.WriteString(fmt.Sprintf("%v", part))
+		}
+	}
+
 	finalContent := fmt.Sprintf("---\ntitle: \"[리뷰] %s\"\ndate: %s\ntags: [Algorithm, Java]\n---\n\n%s", 
-		filePath, time.Now().Format("2006-01-02"), result)
+		baseName, time.Now().Format("2006-01-02"), result.String())
 
 	err := os.WriteFile(reviewPath, []byte(finalContent), 0644)
 	if err != nil {
