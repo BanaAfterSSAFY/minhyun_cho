@@ -14,6 +14,14 @@ import (
 )
 
 func main() {
+	fmt.Println("AI 리뷰어 프로세스 시작...")
+	reviewDir := "reviews"
+
+	// 1. reviews 폴더가 없으면 생성함
+	if err := os.MkdirAll(reviewDir, 0755); err != nil {
+		log.Fatalf("reviews 폴더 생성 실패: %v", err)
+	}
+
 	apiKey := os.Getenv("GEMINI_API_KEY")
 	ctx := context.Background()
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
@@ -22,52 +30,58 @@ func main() {
 	}
 	defer client.Close()
 
-	model := client.GenerativeModel("gemini-2.5-pro")
+	model := client.GenerativeModel("gemini-2.5-flash")
 
-	// 1. 기존 증분 추적 로직 (주석 처리)
-	/*
-	out, _ := exec.Command("git", "diff", "--name-only", "HEAD^", "HEAD").Output()
-	allFiles := strings.Split(string(out), "\n")
-	*/
-
-	// 2. 레포지토리 내 모든 .java 파일 가져오기
 	javaFiles := getAllJavaFiles()
-	if len(javaFiles) == 0 {
-		fmt.Println("리뷰할 .java 파일이 없음.")
-		return
-	}
+	fmt.Printf("발견된 .java 파일 개수: %d개\n", len(javaFiles))
 
 	for _, filePath := range javaFiles {
-		processFile(ctx, model, filePath)
+		baseName := filepath.Base(filePath)
+		reviewFileName := strings.TrimSuffix(baseName, ".java")
+		reviewPath := fmt.Sprintf("reviews/%s_review.md", reviewFileName)
+
+		// 2. 중복 체크: 이미 리뷰가 존재하면 건너뜀 (할당량 절약)
+		if _, err := os.Stat(reviewPath); err == nil {
+			fmt.Printf("[%s] 이미 리뷰가 존재하여 건너뜀.\n", filePath)
+			continue
+		}
+
+		// 3. 리뷰 프로세스 실행
+		processFile(ctx, model, filePath, reviewPath)
+
+		// 4. Rate Limit(429) 방지를 위한 15초 지연 (무료 티어 권장 사항)
+		fmt.Println("다음 파일 분석 전 15초간 대기함...")
+		time.Sleep(15 * time.Second)
 	}
 }
 
 func getAllJavaFiles() []string {
 	var javaFiles []string
-	// 현재 폴더(.)부터 하위 폴더까지 모든 파일을 탐색함
 	err := filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		// 파일이면서 .java 확장자인 경우만 리스트에 추가함
-		// (단, reviews 폴더 안의 파일이나 숨김 폴더는 제외함)
-		if !info.IsDir() && strings.HasSuffix(path, ".java") && !strings.Contains(path, "reviews") {
+		// .java 확장자이면서 시스템 폴더가 아닌 경우만 수집함
+		isJava := strings.HasSuffix(strings.ToLower(path), ".java")
+		isSystem := strings.Contains(path, "reviews") || strings.Contains(path, ".git") || info.IsDir()
+
+		if isJava && !isSystem {
 			javaFiles = append(javaFiles, path)
 		}
 		return nil
 	})
 	if err != nil {
-		log.Printf("파일 탐색 중 에러 발생: %v", err)
+		log.Printf("파일 탐색 중 에러: %v", err)
 	}
 	return javaFiles
 }
 
-func processFile(ctx context.Context, model *genai.GenerativeModel, filePath string) {
-	fmt.Printf("%s 파일 분석 및 리뷰 중...\n", filePath)
+func processFile(ctx context.Context, model *genai.GenerativeModel, filePath string, reviewPath string) {
+	fmt.Printf("[%s] 분석 및 리뷰 중...\n", filePath)
 
 	content, err := os.ReadFile(filePath)
 	if err != nil {
-		log.Printf("%s 파일 읽기 실패: %v", filePath, err)
+		log.Printf("%s 읽기 실패: %v", filePath, err)
 		return
 	}
 
@@ -79,7 +93,7 @@ func processFile(ctx context.Context, model *genai.GenerativeModel, filePath str
 2. 시간 복잡도와 공간 복잡도 분석
 3. 코드에서 개선할 점이나 주의해야 할 예외 케이스(Edge Case)
 
-파일 이름: %s
+파일명: %s
 코드 내용:
 %s
 `, filePath, string(content))
@@ -90,37 +104,26 @@ func processFile(ctx context.Context, model *genai.GenerativeModel, filePath str
 		return
 	}
 
-	saveReview(filePath, resp)
+	saveReview(filePath, reviewPath, resp)
 }
 
-func saveReview(filePath string, resp *genai.GenerateContentResponse) {
-	reviewDir := "reviews"
-	// reviews 폴더가 없으면 생성함
-	if _, err := os.Stat(reviewDir); os.IsNotExist(err) {
-		err := os.MkdirAll(reviewDir, 0755)
-		if err != nil {
-			log.Printf("폴더 생성 실패: %v", err)
-			return
-		}
-	}
-
-	// 파일 경로에서 파일명만 추출하여 저장용 이름 생성함
-	baseName := filepath.Base(filePath)
-	reviewFileName := strings.TrimSuffix(baseName, ".java")
-	reviewPath := fmt.Sprintf("%s/%s_review.md", reviewDir, reviewFileName)
-
+func saveReview(filePath string, reviewPath string, resp *genai.GenerateContentResponse) {
 	var result strings.Builder
 	for _, cand := range resp.Candidates {
-		for _, part := range cand.Content.Parts {
-			result.WriteString(fmt.Sprintf("%v", part))
+		if cand.Content != nil {
+			for _, part := range cand.Content.Parts {
+				result.WriteString(fmt.Sprintf("%v", part))
+			}
 		}
 	}
 
 	finalContent := fmt.Sprintf("---\ntitle: \"[리뷰] %s\"\ndate: %s\ntags: [Algorithm, Java]\n---\n\n%s", 
-		baseName, time.Now().Format("2006-01-02"), result.String())
+		filepath.Base(filePath), time.Now().Format("2006-01-02"), result.String())
 
 	err := os.WriteFile(reviewPath, []byte(finalContent), 0644)
 	if err != nil {
-		log.Printf("파일 저장 실패: %v", err)
+		log.Printf("%s 저장 실패: %v", reviewPath, err)
+	} else {
+		fmt.Printf("%s 저장 완료!\n", reviewPath)
 	}
 }
